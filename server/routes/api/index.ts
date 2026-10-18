@@ -42,6 +42,7 @@ import pins from "./pins";
 import reactions from "./reactions";
 import relationships from "./relationships";
 import revisions from "./revisions";
+import richard from "./richard";
 import searches from "./searches";
 import shares from "./shares";
 import stars from "./stars";
@@ -122,6 +123,7 @@ router.use("/", fileOperationsRoute.routes());
 router.use("/", urls.routes());
 router.use("/", userMemberships.routes());
 router.use("/", reactions.routes());
+router.use("/", richard.routes());
 router.use("/", relationships.routes());
 router.use("/", imports.routes());
 

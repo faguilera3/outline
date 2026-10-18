@@ -904,6 +904,22 @@ export class Environment {
     this.toOptionalNumber(environment.POPULARITY_UPDATE_INTERVAL_HOURS) ?? 12;
 
   /**
+   * Base URL of an OpenAI-compatible API endpoint used by the Richard chat
+   * integration. Requests are proxied to `${RICHARD_API_URL}/chat/completions`.
+   */
+  @IsOptional()
+  public RICHARD_API_URL =
+    this.toOptionalString(environment.RICHARD_API_URL) ??
+    "http://hermes:8642/v1";
+
+  /**
+   * Bearer token sent to the OpenAI-compatible API endpoint used by the Richard
+   * chat integration. The integration is disabled while this is unset.
+   */
+  @IsOptional()
+  public RICHARD_API_KEY = environment.RICHARD_API_KEY ?? "";
+
+  /**
    * Returns true if the current installation is the cloud hosted version at
    * getoutline.com
    */

@@ -24,6 +24,7 @@ import presentPublicTeam from "./publicTeam";
 import presentReaction from "./reaction";
 import presentRelationship from "./relationship";
 import presentRevision from "./revision";
+import presentRichardAnswer from "./richard";
 import presentSearchQuery from "./searchQuery";
 import presentShare from "./share";
 import presentStar from "./star";
@@ -64,6 +65,7 @@ export {
   presentReaction,
   presentRelationship,
   presentRevision,
+  presentRichardAnswer,
   presentSearchQuery,
   presentShare,
   presentStar,
