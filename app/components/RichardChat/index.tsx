@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import styled from "styled-components";
 import { depths, s } from "@shared/styles";
 import Button from "~/components/Button";
+import useStores from "~/hooks/useStores";
 import { client } from "~/utils/ApiClient";
 
 /** A single message in the conversation, as stored on the client. */
@@ -11,11 +12,49 @@ interface ChatMessage {
   content: string;
 }
 
+/** The document the user is viewing, forwarded alongside the conversation. */
+interface ChatDocumentContext {
+  title: string;
+  documentId: string;
+}
+
 /** The response envelope returned by the `/richard.chat` endpoint. */
-interface ChatResponse {
+interface ChatStartResponse {
   data: {
-    answer: string;
+    jobId: string;
   };
+}
+
+/** The lifecycle state of an asynchronous chat job. */
+type RichardJobStatus = "pending" | "done" | "error";
+
+/** The response envelope returned by the `/richard.job` endpoint. */
+interface ChatJobResponse {
+  data: {
+    status: RichardJobStatus;
+    answer: string | null;
+    error: string | null;
+    elapsedMs: number;
+  };
+}
+
+/** How often the client polls the job endpoint, in milliseconds. */
+const POLL_INTERVAL = 2000;
+
+/** How long the client waits for the job before showing a timeout, in ms. */
+const POLL_TIMEOUT = 6 * 60 * 1000;
+
+/** Fallback message shown when a request fails without a usable error. */
+const GENERIC_ERROR = "Algo salió mal.";
+
+/**
+ * Returns a user-facing message for an unknown error thrown by the API client.
+ *
+ * @param err the thrown error.
+ * @returns the error message, or a generic fallback.
+ */
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : GENERIC_ERROR;
 }
 
 /**
@@ -23,11 +62,15 @@ interface ChatResponse {
  * server proxy. Mounted once in the authenticated layout.
  */
 export function RichardChat() {
+  const { documents } = useStores();
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [listElement, setListElement] = useState<HTMLDivElement | null>(null);
+  const startedAtRef = useRef<number | null>(null);
 
   const handleToggle = useCallback(() => {
     setIsOpen((open) => !open);
@@ -59,6 +102,16 @@ export function RichardChat() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen]);
 
+  const appendAssistant = useCallback((content: string) => {
+    setMessages((current) => [...current, { role: "assistant", content }]);
+  }, []);
+
+  const finishJob = useCallback(() => {
+    setJobId(null);
+    setIsSending(false);
+    startedAtRef.current = null;
+  }, []);
+
   // Keep the latest message in view as the conversation grows.
   useEffect(() => {
     if (listElement) {
@@ -66,31 +119,109 @@ export function RichardChat() {
     }
   }, [listElement, messages, isSending]);
 
-  const send = useCallback(async (history: ChatMessage[]) => {
-    setIsSending(true);
-    try {
-      const response = await client.post<ChatResponse>("/richard.chat", {
-        messages: history.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
-      });
-      setMessages([
-        ...history,
-        { role: "assistant", content: response.data.answer },
-      ]);
-    } catch (err) {
-      setMessages([
-        ...history,
-        {
-          role: "assistant",
-          content: err instanceof Error ? err.message : "Algo salió mal.",
-        },
-      ]);
-    } finally {
-      setIsSending(false);
+  const startJob = useCallback(
+    async (
+      history: ChatMessage[],
+      documentContext: ChatDocumentContext | null
+    ) => {
+      setIsSending(true);
+      setElapsed(0);
+      startedAtRef.current = Date.now();
+      try {
+        const response = await client.post<ChatStartResponse>("/richard.chat", {
+          messages: history.map((message) => ({
+            role: message.role,
+            content: message.content,
+          })),
+          documentContext,
+        });
+        setJobId(response.data.jobId);
+      } catch (err) {
+        appendAssistant(getErrorMessage(err));
+        finishJob();
+      }
+    },
+    [appendAssistant, finishJob]
+  );
+
+  // Poll the job endpoint until it settles, the panel closes, or it times out.
+  useEffect(() => {
+    if (!isOpen || !jobId) {
+      return;
     }
-  }, []);
+
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      if (cancelled) {
+        return;
+      }
+
+      const startedAt = startedAtRef.current;
+      if (startedAt !== null && Date.now() - startedAt > POLL_TIMEOUT) {
+        appendAssistant(
+          "Richard tardó demasiado en responder. Probá de nuevo."
+        );
+        finishJob();
+        return;
+      }
+
+      try {
+        const response = await client.get<ChatJobResponse>("/richard.job", {
+          id: jobId,
+        });
+        if (cancelled) {
+          return;
+        }
+
+        const { status, answer, error } = response.data;
+        if (status === "done") {
+          appendAssistant(answer ?? "");
+          finishJob();
+          return;
+        }
+        if (status === "error") {
+          appendAssistant(error ?? GENERIC_ERROR);
+          finishJob();
+          return;
+        }
+        timer = window.setTimeout(poll, POLL_INTERVAL);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        appendAssistant(getErrorMessage(err));
+        finishJob();
+      }
+    };
+
+    timer = window.setTimeout(poll, POLL_INTERVAL);
+
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [isOpen, jobId, appendAssistant, finishJob]);
+
+  // Track the elapsed seconds while a job is in flight, for the wait label.
+  useEffect(() => {
+    if (!isOpen || !jobId) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      if (startedAtRef.current !== null) {
+        setElapsed(
+          Math.floor((Date.now() - startedAtRef.current) / 1000)
+        );
+      }
+    }, 1000);
+
+    return () => window.clearInterval(interval);
+  }, [isOpen, jobId]);
 
   const handleSubmit = useCallback(() => {
     const content = input.trim();
@@ -99,10 +230,18 @@ export function RichardChat() {
     }
 
     const history: ChatMessage[] = [...messages, { role: "user", content }];
+
+    // Read the active document at send time, not during render, so the panel
+    // is not subscribed to document changes.
+    const active = documents.active;
+    const documentContext: ChatDocumentContext | null = active
+      ? { title: active.title, documentId: active.id }
+      : null;
+
     setMessages(history);
     setInput("");
-    void send(history);
-  }, [input, isSending, messages, send]);
+    void startJob(history, documentContext);
+  }, [input, isSending, messages, documents, startJob]);
 
   const handleKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -147,7 +286,9 @@ export function RichardChat() {
                 {message.content}
               </Bubble>
             ))}
-            {isSending && <Bubble $role="assistant">Pensando…</Bubble>}
+            {isSending && (
+              <Bubble $role="assistant">Pensando… {elapsed}s</Bubble>
+            )}
           </Messages>
           <Composer>
             <Textarea
