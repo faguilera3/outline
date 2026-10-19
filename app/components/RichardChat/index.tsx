@@ -2,11 +2,14 @@ import {
   CheckmarkIcon,
   CloseIcon,
   CopyIcon,
+  HistoryIcon,
+  PlusIcon,
   SparklesIcon,
+  TrashIcon,
   WarningIcon,
 } from "outline-icons";
 import { darken } from "polished";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import styled, { keyframes } from "styled-components";
 import type { DefaultTheme } from "styled-components";
@@ -15,12 +18,21 @@ import Button from "~/components/Button";
 import useStores from "~/hooks/useStores";
 import { client } from "~/utils/ApiClient";
 
-/** A single message in the conversation, as stored on the client. */
+/** A single message in a conversation, as stored on the client. */
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   /** Whether the message represents a failed request, styled apart. */
   isError?: boolean;
+}
+
+/** A persisted conversation between the user and Richard. */
+interface Conversation {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
 }
 
 /** The document the user is viewing, forwarded alongside the conversation. */
@@ -34,6 +46,9 @@ interface Suggestion {
   label: string;
   prompt: string;
 }
+
+/** Which surface the panel is currently showing. */
+type ChatView = "chat" | "history";
 
 /** The response envelope returned by the `/richard.chat` endpoint. */
 interface ChatStartResponse {
@@ -64,10 +79,25 @@ const POLL_TIMEOUT = 6 * 60 * 1000;
 /** Fallback message shown when a request fails without a usable error. */
 const GENERIC_ERROR = "Algo salió mal.";
 
+/** Local storage key holding the serialized conversation list. */
+const CONVERSATIONS_STORAGE_KEY = "richard-chat-conversations";
+
+/** Local storage key holding the id of the conversation in view. */
+const ACTIVE_CONVERSATION_STORAGE_KEY = "richard-chat-active-id";
+
+/** How many conversations are kept before the oldest are discarded. */
+const MAX_CONVERSATIONS = 20;
+
+/** How many characters of the first user message become the chat title. */
+const TITLE_MAX_LENGTH = 40;
+
+/** Title given to a conversation without a user message yet. */
+const EMPTY_TITLE = "Conversación nueva";
+
 /** Maximum height of the composer textarea, roughly six lines. */
 const TEXTAREA_MAX_HEIGHT = 144;
 
-/** Starter prompts shown while the conversation is still empty. */
+/** Starter prompts shown when a conversation is still empty. */
 const SUGGESTIONS: Suggestion[] = [
   { label: "Resumime este documento", prompt: "Resumime este documento" },
   {
@@ -88,18 +118,191 @@ function getErrorMessage(err: unknown): string {
 }
 
 /**
+ * Builds a reasonably unique id without a server round-trip.
+ *
+ * @returns a short id combining a timestamp and random suffix.
+ */
+function createId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Creates an empty conversation ready to receive messages.
+ *
+ * @returns a fresh conversation with an automatic placeholder title.
+ */
+function createConversation(): Conversation {
+  const now = Date.now();
+  return {
+    id: createId(),
+    title: EMPTY_TITLE,
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Narrows an unknown value to a stored chat message.
+ *
+ * @param value the parsed value.
+ * @returns whether the value is a valid message.
+ */
+function isChatMessage(value: unknown): value is ChatMessage {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const message = value as Record<string, unknown>;
+  return (
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string"
+  );
+}
+
+/**
+ * Narrows an unknown value to a stored conversation.
+ *
+ * @param value the parsed value.
+ * @returns whether the value is a valid conversation.
+ */
+function isConversation(value: unknown): value is Conversation {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const conversation = value as Record<string, unknown>;
+  return (
+    typeof conversation.id === "string" &&
+    typeof conversation.title === "string" &&
+    typeof conversation.createdAt === "number" &&
+    typeof conversation.updatedAt === "number" &&
+    Array.isArray(conversation.messages) &&
+    conversation.messages.every(isChatMessage)
+  );
+}
+
+/**
+ * Reads the persisted conversations, tolerating absent or corrupted storage.
+ *
+ * @returns the stored conversations, or an empty array.
+ */
+function loadConversations(): Conversation[] {
+  if (typeof window === "undefined") {
+    return [];
+  }
+  try {
+    const raw = window.localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter(isConversation);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Keeps at most {@link MAX_CONVERSATIONS} conversations, newest first.
+ *
+ * @param conversations the conversations to trim.
+ * @returns the newest conversations, capped by count.
+ */
+function trimConversations(conversations: Conversation[]): Conversation[] {
+  return [...conversations]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, MAX_CONVERSATIONS);
+}
+
+/**
+ * Derives a short title from the first user message of a conversation.
+ *
+ * @param messages the conversation messages.
+ * @returns the trimmed title, or the placeholder title when unnamed.
+ */
+function titleFromMessages(messages: ChatMessage[]): string {
+  const firstUser = messages.find((message) => message.role === "user");
+  if (!firstUser) {
+    return EMPTY_TITLE;
+  }
+  const trimmed = firstUser.content.trim().replace(/\s+/g, " ");
+  if (!trimmed) {
+    return EMPTY_TITLE;
+  }
+  return trimmed.length > TITLE_MAX_LENGTH
+    ? `${trimmed.slice(0, TITLE_MAX_LENGTH)}…`
+    : trimmed;
+}
+
+/**
+ * Formats a timestamp as a brief relative label in Spanish.
+ *
+ * @param timestamp the moment to describe, in milliseconds.
+ * @returns a short relative label.
+ */
+function formatRelativeTime(timestamp: number): string {
+  const minutes = Math.floor((Date.now() - timestamp) / 60000);
+  if (minutes < 1) {
+    return "ahora";
+  }
+  if (minutes < 60) {
+    return `hace ${minutes} min`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `hace ${hours} h`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    return `hace ${days} d`;
+  }
+  return new Date(timestamp).toLocaleDateString();
+}
+
+/**
+ * Resolves the conversation to open on mount, preferring the persisted id.
+ *
+ * @param conversations the already loaded conversations to validate against.
+ * @returns the id of the conversation to make active.
+ */
+function resolveInitialActiveId(conversations: Conversation[]): string {
+  if (typeof window !== "undefined") {
+    try {
+      const stored = window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+      if (stored && conversations.some((c) => c.id === stored)) {
+        return stored;
+      }
+    } catch {
+      // Fall through to the most recently updated conversation.
+    }
+  }
+  return trimConversations(conversations)[0].id;
+}
+
+/**
  * Floating chat panel that talks to the Richard agent through the Outline
- * server proxy. Mounted once in the authenticated layout.
+ * server proxy. Keeps a client-side history of conversations in local storage.
+ * Mounted once in the authenticated layout.
  *
  * @returns the floating chat button and its panel.
  */
 export function RichardChat() {
   const { documents } = useStores();
   const [isOpen, setIsOpen] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [view, setView] = useState<ChatView>("chat");
+  const [conversations, setConversations] = useState<Conversation[]>(() => {
+    const stored = loadConversations();
+    return stored.length > 0 ? trimConversations(stored) : [createConversation()];
+  });
+  const [activeId, setActiveId] = useState<string>(() =>
+    resolveInitialActiveId(conversations)
+  );
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
+  const [jobConversationId, setJobConversationId] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [listElement, setListElement] = useState<HTMLDivElement | null>(null);
@@ -108,17 +311,60 @@ export function RichardChat() {
   );
   const startedAtRef = useRef<number | null>(null);
 
+  const activeConversation = useMemo(
+    () =>
+      conversations.find((conversation) => conversation.id === activeId) ??
+      trimConversations(conversations)[0],
+    [conversations, activeId]
+  );
+
+  const sortedConversations = useMemo(
+    () => trimConversations(conversations),
+    [conversations]
+  );
+
   const handleToggle = useCallback(() => {
     setIsOpen((open) => !open);
   }, []);
 
   const handleClose = useCallback(() => {
     setIsOpen(false);
+    setView("chat");
+  }, []);
+
+  const handleToggleHistory = useCallback(() => {
+    setView((current) => (current === "history" ? "chat" : "history"));
   }, []);
 
   const handleChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => {
     setInput(event.target.value);
   }, []);
+
+  // Persist the conversation list so the thread survives a page reload.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        CONVERSATIONS_STORAGE_KEY,
+        JSON.stringify(conversations)
+      );
+    } catch {
+      // Ignore quota or privacy-mode failures; the chat still works in-session.
+    }
+  }, [conversations]);
+
+  // Persist which conversation was in view, so reloads resume the same thread.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, activeId);
+    } catch {
+      // Ignore storage failures; the panel still works for this session.
+    }
+  }, [activeId]);
+
+  // Forget the transient "copied" confirmation when switching conversation.
+  useEffect(() => {
+    setCopiedIndex(null);
+  }, [activeId]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -127,20 +373,20 @@ export function RichardChat() {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setIsOpen(false);
+        handleClose();
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isOpen]);
+  }, [isOpen, handleClose]);
 
-  // Move focus to the composer when the panel opens.
+  // Move focus to the composer when the panel opens or returns to the thread.
   useEffect(() => {
-    if (isOpen && textareaElement) {
+    if (isOpen && view === "chat" && textareaElement) {
       textareaElement.focus();
     }
-  }, [isOpen, textareaElement]);
+  }, [isOpen, view, textareaElement]);
 
   // Grow the textarea with its content, up to a handful of lines.
   useEffect(() => {
@@ -155,31 +401,50 @@ export function RichardChat() {
     textareaElement.style.height = `${nextHeight}px`;
   }, [textareaElement, input]);
 
-  const appendAssistant = useCallback((content: string, isError = false) => {
-    const message: ChatMessage = { role: "assistant", content, isError };
-    setMessages((current) => [...current, message]);
-  }, []);
+  const appendAssistant = useCallback(
+    (conversationId: string, content: string, isError = false) => {
+      const message: ChatMessage = { role: "assistant", content, isError };
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === conversationId
+            ? {
+                ...conversation,
+                messages: [...conversation.messages, message],
+                updatedAt: Date.now(),
+              }
+            : conversation
+        )
+      );
+    },
+    []
+  );
 
   const finishJob = useCallback(() => {
     setJobId(null);
+    setJobConversationId(null);
     setIsSending(false);
     startedAtRef.current = null;
   }, []);
+
+  const isThinkingHere =
+    isSending && jobConversationId === activeConversation.id;
 
   // Keep the latest message in view as the conversation grows.
   useEffect(() => {
     if (listElement) {
       listElement.scrollTop = listElement.scrollHeight;
     }
-  }, [listElement, messages, isSending]);
+  }, [listElement, activeConversation, isThinkingHere]);
 
   const startJob = useCallback(
     async (
       history: ChatMessage[],
-      documentContext: ChatDocumentContext | null
+      documentContext: ChatDocumentContext | null,
+      conversationId: string
     ) => {
       setIsSending(true);
       setElapsed(0);
+      setJobConversationId(conversationId);
       startedAtRef.current = Date.now();
       try {
         const response = await client.post<ChatStartResponse>("/richard.chat", {
@@ -191,7 +456,7 @@ export function RichardChat() {
         });
         setJobId(response.data.jobId);
       } catch (err) {
-        appendAssistant(getErrorMessage(err), true);
+        appendAssistant(conversationId, getErrorMessage(err), true);
         finishJob();
       }
     },
@@ -199,8 +464,10 @@ export function RichardChat() {
   );
 
   // Poll the job endpoint until it settles, the panel closes, or it times out.
+  // The answer is written back to the conversation that launched the job, so
+  // switching threads mid-flight never mixes a reply into the wrong chat.
   useEffect(() => {
-    if (!isOpen || !jobId) {
+    if (!isOpen || !jobId || !jobConversationId) {
       return;
     }
 
@@ -214,7 +481,11 @@ export function RichardChat() {
 
       const startedAt = startedAtRef.current;
       if (startedAt !== null && Date.now() - startedAt > POLL_TIMEOUT) {
-        appendAssistant("Richard tardó demasiado en responder. Probá de nuevo.", true);
+        appendAssistant(
+          jobConversationId,
+          "Richard tardó demasiado en responder. Probá de nuevo.",
+          true
+        );
         finishJob();
         return;
       }
@@ -229,12 +500,12 @@ export function RichardChat() {
 
         const { status, answer, error } = response.data;
         if (status === "done") {
-          appendAssistant(answer ?? "", false);
+          appendAssistant(jobConversationId, answer ?? "", false);
           finishJob();
           return;
         }
         if (status === "error") {
-          appendAssistant(error ?? GENERIC_ERROR, true);
+          appendAssistant(jobConversationId, error ?? GENERIC_ERROR, true);
           finishJob();
           return;
         }
@@ -243,7 +514,7 @@ export function RichardChat() {
         if (cancelled) {
           return;
         }
-        appendAssistant(getErrorMessage(err), true);
+        appendAssistant(jobConversationId, getErrorMessage(err), true);
         finishJob();
       }
     };
@@ -256,7 +527,7 @@ export function RichardChat() {
         window.clearTimeout(timer);
       }
     };
-  }, [isOpen, jobId, appendAssistant, finishJob]);
+  }, [isOpen, jobId, jobConversationId, appendAssistant, finishJob]);
 
   // Track the elapsed seconds while a job is in flight, for the wait label.
   useEffect(() => {
@@ -279,7 +550,26 @@ export function RichardChat() {
       return;
     }
 
-    const history: ChatMessage[] = [...messages, { role: "user", content }];
+    const conversationId = activeConversation.id;
+    const userMessage: ChatMessage = { role: "user", content };
+
+    // The full history is resent on every turn because the server derives the
+    // session from the first message of the list: sending only the latest
+    // turns would start a brand new session instead of continuing this one.
+    const history: ChatMessage[] = [...activeConversation.messages, userMessage];
+
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              title: titleFromMessages(history),
+              messages: history,
+              updatedAt: Date.now(),
+            }
+          : conversation
+      )
+    );
 
     // Read the active document at send time, not during render, so the panel
     // is not subscribed to document changes.
@@ -288,10 +578,9 @@ export function RichardChat() {
       ? { title: active.title, documentId: active.id }
       : null;
 
-    setMessages(history);
     setInput("");
-    void startJob(history, documentContext);
-  }, [input, isSending, messages, documents, startJob]);
+    void startJob(history, documentContext, conversationId);
+  }, [input, isSending, activeConversation, documents, startJob]);
 
   const handleKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -323,7 +612,55 @@ export function RichardChat() {
     }
   }, []);
 
-  const showEmpty = messages.length === 0 && !isSending;
+  const handleNewChat = useCallback(() => {
+    setView("chat");
+    setInput("");
+
+    // Reuse the current thread if it is already blank, so "New chat" pressed
+    // twice does not pile up empty conversations.
+    if (activeConversation.messages.length === 0) {
+      return;
+    }
+
+    const conversation = createConversation();
+    setConversations((current) =>
+      trimConversations([conversation, ...current])
+    );
+    setActiveId(conversation.id);
+  }, [activeConversation]);
+
+  const handleSelectConversation = useCallback((id: string) => {
+    setActiveId(id);
+    setView("chat");
+  }, []);
+
+  const handleDeleteConversation = useCallback(
+    (id: string) => {
+      const remaining = conversations.filter(
+        (conversation) => conversation.id !== id
+      );
+
+      if (remaining.length === 0) {
+        const conversation = createConversation();
+        setConversations([conversation]);
+        setActiveId(conversation.id);
+        return;
+      }
+
+      setConversations(remaining);
+
+      if (activeId === id) {
+        setActiveId(trimConversations(remaining)[0].id);
+      }
+    },
+    [conversations, activeId]
+  );
+
+  const messages = activeConversation.messages;
+  const showEmpty = messages.length === 0 && !isThinkingHere;
+  const hasHistory = sortedConversations.some(
+    (conversation) => conversation.messages.length > 0
+  );
 
   return (
     <>
@@ -347,6 +684,23 @@ export function RichardChat() {
             <HeaderActions>
               <IconButton
                 type="button"
+                aria-label="Nuevo chat"
+                title="Nuevo chat"
+                onClick={handleNewChat}
+              >
+                <PlusIcon size={18} />
+              </IconButton>
+              <IconButton
+                type="button"
+                aria-label="Historial de conversaciones"
+                title="Historial de conversaciones"
+                aria-pressed={view === "history"}
+                onClick={handleToggleHistory}
+              >
+                <HistoryIcon size={18} />
+              </IconButton>
+              <IconButton
+                type="button"
                 aria-label="Cerrar chat"
                 title="Cerrar chat"
                 onClick={handleClose}
@@ -355,112 +709,152 @@ export function RichardChat() {
               </IconButton>
             </HeaderActions>
           </PanelHeader>
-          <Messages
-            ref={setListElement}
-            role="log"
-            aria-live="polite"
-            aria-busy={isSending}
-          >
-            {showEmpty && (
-              <EmptyState>
-                <EmptyIcon aria-hidden="true">
-                  <SparklesIcon size={22} />
-                </EmptyIcon>
-                <EmptyTitle>¿En qué te ayudo?</EmptyTitle>
-                <EmptyText>
-                  Escribí una consulta o arrancá con una de estas ideas.
-                </EmptyText>
-                <SuggestionList>
-                  {SUGGESTIONS.map((suggestion) => (
-                    <SuggestionChip
-                      key={suggestion.label}
-                      type="button"
-                      onClick={() => handleSuggestion(suggestion.prompt)}
-                    >
-                      {suggestion.label}
-                    </SuggestionChip>
-                  ))}
-                </SuggestionList>
-              </EmptyState>
-            )}
-            {messages.map((message, index) => (
-              <MessageRow key={index} $role={message.role}>
-                <MessageBubble $role={message.role} $error={message.isError}>
-                  {message.role === "assistant" && (
-                    <MessageRole>
-                      <SparklesIcon size={13} />
-                      Richard
-                    </MessageRole>
-                  )}
-                  {message.isError ? (
-                    <ErrorLine>
-                      <WarningIcon size={15} />
-                      <MessageText>{message.content}</MessageText>
-                    </ErrorLine>
-                  ) : (
-                    <MessageText>{message.content}</MessageText>
-                  )}
-                </MessageBubble>
-                {message.role === "assistant" && !message.isError && (
-                  <CopyButton
-                    type="button"
-                    aria-label={
-                      copiedIndex === index ? "Copiado" : "Copiar respuesta"
-                    }
-                    onClick={() => handleCopy(index, message.content)}
+
+          {view === "history" ? (
+            <HistoryList aria-label="Conversaciones anteriores">
+              {!hasHistory && (
+                <HistoryEmpty>
+                  Todavía no tenés conversaciones guardadas. Van a aparecer acá a
+                  medida que charles con Richard.
+                </HistoryEmpty>
+              )}
+              {sortedConversations
+                .filter((conversation) => conversation.messages.length > 0)
+                .map((conversation) => (
+                  <HistoryItem
+                    key={conversation.id}
+                    $active={conversation.id === activeConversation.id}
                   >
-                    {copiedIndex === index ? (
-                      <>
-                        <CheckmarkIcon size={14} />
-                        Copiado
-                      </>
-                    ) : (
-                      <CopyIcon size={14} />
-                    )}
-                  </CopyButton>
-                )}
-              </MessageRow>
-            ))}
-            {isSending && (
-              <MessageRow $role="assistant">
-                <MessageBubble $role="assistant">
-                  <MessageRole>
-                    <SparklesIcon size={13} />
-                    Richard
-                  </MessageRole>
-                  <ThinkingLine>
-                    <Dots aria-hidden="true">
-                      <Dot $delay={0} />
-                      <Dot $delay={160} />
-                      <Dot $delay={320} />
-                    </Dots>
-                    <ThinkingSeconds>{elapsed}s</ThinkingSeconds>
-                  </ThinkingLine>
-                </MessageBubble>
-              </MessageRow>
-            )}
-          </Messages>
-          <Composer>
-            <Textarea
-              ref={setTextareaElement}
-              aria-label="Mensaje para Richard"
-              placeholder="Escribí un mensaje…"
-              rows={1}
-              value={input}
-              onChange={handleChange}
-              onKeyDown={handleKeyDown}
-            />
-            <ComposerFooter>
-              <ShortcutHint>Ctrl/Cmd + Enter para enviar</ShortcutHint>
-              <Button
-                type="button"
-                onClick={handleSubmit}
-                disabled={isSending || input.trim() === ""}
+                    <HistorySelect
+                      type="button"
+                      onClick={() => handleSelectConversation(conversation.id)}
+                      aria-label={`Abrir conversación: ${conversation.title}`}
+                    >
+                      <HistoryTitle>{conversation.title}</HistoryTitle>
+                      <HistoryMeta>
+                        {formatRelativeTime(conversation.updatedAt)}
+                      </HistoryMeta>
+                    </HistorySelect>
+                    <HistoryDelete
+                      type="button"
+                      aria-label={`Borrar conversación: ${conversation.title}`}
+                      onClick={() => handleDeleteConversation(conversation.id)}
+                    >
+                      <TrashIcon size={15} />
+                    </HistoryDelete>
+                  </HistoryItem>
+                ))}
+            </HistoryList>
+          ) : (
+            <>
+              <Messages
+                ref={setListElement}
+                role="log"
+                aria-live="polite"
+                aria-busy={isThinkingHere}
               >
-                Enviar
-              </Button>
-            </ComposerFooter>
-          </Composer>
+                {showEmpty && (
+                  <EmptyState>
+                    <EmptyIcon aria-hidden="true">
+                      <SparklesIcon size={22} />
+                    </EmptyIcon>
+                    <EmptyTitle>¿En qué te ayudo?</EmptyTitle>
+                    <EmptyText>
+                      Escribí una consulta o arrancá con una de estas ideas.
+                    </EmptyText>
+                    <SuggestionList>
+                      {SUGGESTIONS.map((suggestion) => (
+                        <SuggestionChip
+                          key={suggestion.label}
+                          type="button"
+                          onClick={() => handleSuggestion(suggestion.prompt)}
+                        >
+                          {suggestion.label}
+                        </SuggestionChip>
+                      ))}
+                    </SuggestionList>
+                  </EmptyState>
+                )}
+                {messages.map((message, index) => (
+                  <MessageRow key={index} $role={message.role}>
+                    <MessageBubble $role={message.role} $error={message.isError}>
+                      {message.role === "assistant" && (
+                        <MessageRole>
+                          <SparklesIcon size={13} />
+                          Richard
+                        </MessageRole>
+                      )}
+                      {message.isError ? (
+                        <ErrorLine>
+                          <WarningIcon size={15} />
+                          <MessageText>{message.content}</MessageText>
+                        </ErrorLine>
+                      ) : (
+                        <MessageText>{message.content}</MessageText>
+                      )}
+                    </MessageBubble>
+                    {message.role === "assistant" && !message.isError && (
+                      <CopyButton
+                        type="button"
+                        aria-label={
+                          copiedIndex === index ? "Copiado" : "Copiar respuesta"
+                        }
+                        onClick={() => handleCopy(index, message.content)}
+                      >
+                        {copiedIndex === index ? (
+                          <>
+                            <CheckmarkIcon size={14} />
+                            Copiado
+                          </>
+                        ) : (
+                          <CopyIcon size={14} />
+                        )}
+                      </CopyButton>
+                    )}
+                  </MessageRow>
+                ))}
+                {isThinkingHere && (
+                  <MessageRow $role="assistant">
+                    <MessageBubble $role="assistant">
+                      <MessageRole>
+                        <SparklesIcon size={13} />
+                        Richard
+                      </MessageRole>
+                      <ThinkingLine>
+                        <Dots aria-hidden="true">
+                          <Dot $delay={0} />
+                          <Dot $delay={160} />
+                          <Dot $delay={320} />
+                        </Dots>
+                        <ThinkingSeconds>{elapsed}s</ThinkingSeconds>
+                      </ThinkingLine>
+                    </MessageBubble>
+                  </MessageRow>
+                )}
+              </Messages>
+              <Composer>
+                <Textarea
+                  ref={setTextareaElement}
+                  aria-label="Mensaje para Richard"
+                  placeholder="Escribí un mensaje…"
+                  rows={1}
+                  value={input}
+                  onChange={handleChange}
+                  onKeyDown={handleKeyDown}
+                />
+                <ComposerFooter>
+                  <ShortcutHint>Ctrl/Cmd + Enter para enviar</ShortcutHint>
+                  <Button
+                    type="button"
+                    onClick={handleSubmit}
+                    disabled={isSending || input.trim() === ""}
+                  >
+                    Enviar
+                  </Button>
+                </ComposerFooter>
+              </Composer>
+            </>
+          )}
         </Panel>
       )}
     </>
@@ -643,6 +1037,11 @@ const IconButton = styled.button`
 
   &:active {
     transform: scale(0.94);
+  }
+
+  &[aria-pressed="true"] {
+    background: ${s("backgroundSecondary")};
+    color: ${s("accent")};
   }
 
   &:focus-visible {
@@ -880,6 +1279,106 @@ const ThinkingSeconds = styled.span`
   font-size: 12px;
   color: ${s("textSecondary")};
   font-variant-numeric: tabular-nums;
+`;
+
+const HistoryList = styled.ul`
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 14px 12px;
+  list-style: none;
+  overflow-y: auto;
+  ${themedScrollbar}
+`;
+
+const HistoryEmpty = styled.li`
+  padding: 24px 12px;
+  color: ${s("textSecondary")};
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+`;
+
+const HistoryItem = styled.li<{ $active: boolean }>`
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid
+    ${(props) =>
+      props.$active ? props.theme.inputBorderFocused : "transparent"};
+  border-radius: 8px;
+  background: ${(props) =>
+    props.$active ? props.theme.backgroundSecondary : "transparent"};
+  transition: background 120ms ease-out;
+
+  &:hover {
+    background: ${s("backgroundSecondary")};
+  }
+`;
+
+const HistorySelect = styled.button`
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  text-align: start;
+  cursor: var(--pointer);
+
+  &:focus-visible {
+    outline: 2px solid ${s("inputBorderFocused")};
+    outline-offset: -2px;
+  }
+`;
+
+const HistoryTitle = styled.span`
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  font-weight: 500;
+  color: ${s("text")};
+`;
+
+const HistoryMeta = styled.span`
+  font-size: 11px;
+  color: ${s("textSecondary")};
+`;
+
+const HistoryDelete = styled.button`
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  margin-inline-end: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: ${s("textSecondary")};
+  cursor: var(--pointer);
+
+  &:hover {
+    background: ${s("divider")};
+    color: ${s("text")};
+  }
+
+  &:active {
+    transform: scale(0.94);
+  }
+
+  &:focus-visible {
+    outline: 2px solid ${s("inputBorderFocused")};
+    outline-offset: 2px;
+  }
 `;
 
 const Composer = styled.div`
