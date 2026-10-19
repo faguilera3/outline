@@ -46,6 +46,6 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/outline:ai3
+          tags: ghcr.io/${{ github.repository_owner }}/outline:ai4
           build-args: |
             BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/outline-base:ai
