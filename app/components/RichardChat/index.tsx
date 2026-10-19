@@ -74,7 +74,7 @@ interface ChatJobResponse {
 const POLL_INTERVAL = 2000;
 
 /** How long the client waits for the job before showing a timeout, in ms. */
-const POLL_TIMEOUT = 6 * 60 * 1000;
+const POLL_TIMEOUT = 16 * 60 * 1000;
 
 /** Fallback message shown when a request fails without a usable error. */
 const GENERIC_ERROR = "Algo salió mal.";
@@ -483,7 +483,7 @@ export function RichardChat() {
       if (startedAt !== null && Date.now() - startedAt > POLL_TIMEOUT) {
         appendAssistant(
           jobConversationId,
-          "Richard tardó demasiado en responder. Probá de nuevo.",
+          "Richard tardó más de 16 minutos. Puede que el cambio ya esté hecho: revisá el documento, o probá de nuevo.",
           true
         );
         finishJob();
@@ -828,6 +828,12 @@ export function RichardChat() {
                         </Dots>
                         <ThinkingSeconds>{elapsed}s</ThinkingSeconds>
                       </ThinkingLine>
+                      {elapsed >= 30 && (
+                        <ThinkingHint>
+                          Si tengo que buscar en internet o editar un documento,
+                          puede tardar varios minutos.
+                        </ThinkingHint>
+                      )}
                     </MessageBubble>
                   </MessageRow>
                 )}
@@ -1279,6 +1285,13 @@ const ThinkingSeconds = styled.span`
   font-size: 12px;
   color: ${s("textSecondary")};
   font-variant-numeric: tabular-nums;
+`;
+
+const ThinkingHint = styled.p`
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: ${s("textSecondary")};
 `;
 
 const HistoryList = styled.ul`
