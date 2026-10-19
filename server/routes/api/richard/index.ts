@@ -22,10 +22,17 @@ const RICHARD_MODEL = "hermes-agent";
 const MAX_DOCUMENT_CONTEXT_LENGTH = 8000;
 
 /** How long to wait for the Richard agent to respond, in milliseconds. */
-const REQUEST_TIMEOUT = 300000;
+const REQUEST_TIMEOUT = 900000;
 
-/** How long a job is kept in memory before it is swept, in milliseconds. */
-const JOB_RETENTION = 15 * 60 * 1000;
+/** The same ceiling expressed in minutes, for user-facing messages. */
+const REQUEST_TIMEOUT_MINUTES = Math.round(REQUEST_TIMEOUT / 60000);
+
+/**
+ * How long a job is kept in memory before it is swept, in milliseconds. Kept
+ * comfortably above the request timeout so a job cannot disappear while the
+ * client is still polling for its result.
+ */
+const JOB_RETENTION = 30 * 60 * 1000;
 
 /** A message in the OpenAI chat format, including the server-injected system role. */
 interface RichardMessage {
@@ -219,7 +226,19 @@ async function runJob(
       allowPrivateIPAddress: true,
     });
   } catch (err) {
-    failJob(job, "Unable to reach the Richard agent", err, url);
+    // A timeout means the agent may still be working and could have already
+    // applied the change, so say that rather than reporting it as unreachable.
+    const timedOut =
+      err instanceof Error && /timeout/i.test(err.message);
+
+    failJob(
+      job,
+      timedOut
+        ? `Richard estuvo trabajando más de ${REQUEST_TIMEOUT_MINUTES} minutos y se cortó la espera. Puede que el cambio ya esté hecho: revisá el documento.`
+        : "Unable to reach the Richard agent",
+      err,
+      url
+    );
     return;
   }
 
